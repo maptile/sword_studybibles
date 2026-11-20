@@ -4,6 +4,7 @@
     See LICENCE.txt
 """
 import os
+import posixpath
 import zipfile
 import tempfile
 import codecs
@@ -13,11 +14,13 @@ import logging
 import time
 import re
 import optparse
+from html.entities import name2codepoint
+from urllib.parse import unquote
 
 from bs4 import BeautifulSoup
 import jinja2
 
-from .html2osis import HTML2OsisMixin, parse_studybible_reference
+from .html2osis import HTML2OsisMixin, is_html_file, parse_studybible_reference
 from .overlapping import FixOverlappingVersesMixin, sort_tag_content
 from .bibleref import Ref
 
@@ -31,6 +34,21 @@ GENBOOK_TEMPLATE_XML = os.path.join(__file__.rsplit(os.path.sep, 1)[0], 'genbook
 GENBOOK_BRANCH_SEPARATION_LETTER = '/'
 
 logger = logging.getLogger('study2osis')
+
+
+def _replace_html_entity(match):
+    name = match.group(1)
+    if name in ('amp', 'lt', 'gt', 'quot', 'apos') or name not in name2codepoint:
+        return match.group(0)
+    return '&#%d;' % name2codepoint[name]
+
+
+def _read_epub_markup(epub_zip, filename):
+    data = epub_zip.read(filename)
+    if filename.endswith('.html'):
+        # The EPUB uses XHTML markup with HTML named entities.
+        data = re.sub(r'&([a-zA-Z][a-zA-Z0-9]+);', _replace_html_entity, data.decode('utf-8'))
+    return BeautifulSoup(data, 'xml')
 
 
 class Options(object):
@@ -168,7 +186,7 @@ class Commentary(AbstractStudyBible, HTML2OsisMixin, FixOverlappingVersesMixin):
         out.close()
 
     def read_studynotes(self, epub_zip):
-        studynote_files = [i for i in epub_zip.namelist() if i.endswith('studynotes.xhtml')]
+        studynote_files = [i for i in epub_zip.namelist() if is_html_file(i, 'studynotes')]
         if not studynote_files:
             raise Exception('No studynotes in zip file')
 
@@ -178,10 +196,9 @@ class Commentary(AbstractStudyBible, HTML2OsisMixin, FixOverlappingVersesMixin):
         logger.info('Reading studynotes')
         for fn in studynote_files:
             logger.debug('Reading studynotes %s %s', studynote_files.index(fn), fn)
-            data_in = epub_zip.read(fn)
             self.current_filename = fn
 
-            body = BeautifulSoup(data_in, 'xml').find('body')
+            body = _read_epub_markup(epub_zip, fn).find('body')
             for i in body.find_all(recursive=False):
                 i['origFile'] = fn
                 self.osistext.append(i.extract())
@@ -189,7 +206,7 @@ class Commentary(AbstractStudyBible, HTML2OsisMixin, FixOverlappingVersesMixin):
         self._adjust_studynotes()
 
     def read_cross_references(self, epub_zip):
-        crossref_files = [p for p in epub_zip.namelist() if p.endswith('crossrefs.xhtml')]
+        crossref_files = [p for p in epub_zip.namelist() if is_html_file(p, 'crossrefs')]
         if not crossref_files:
             raise Exception('No crossreference in zip file')
 
@@ -198,11 +215,10 @@ class Commentary(AbstractStudyBible, HTML2OsisMixin, FixOverlappingVersesMixin):
 
         logger.info('Reading crossreferences')
         for fn in crossref_files:
-            logger.debug('Reading studynotes %s %s', crossref_files.index(fn), fn)
-            data_in = epub_zip.read(fn)
+            logger.debug('Reading crossreferences %s %s', crossref_files.index(fn), fn)
             self.current_filename = fn
 
-            body = BeautifulSoup(data_in, 'xml').find('body')
+            body = _read_epub_markup(epub_zip, fn).find('body')
             for p in body.find_all('p', class_='crossref', recursive=False):
                 p.extract()
                 verse = Ref(parse_studybible_reference(p.a.extract()['href'].split('#')[1]))
@@ -288,21 +304,40 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
                 h1.extract()
             target.append(bs)
 
+    def _disambiguate_osis_ids(self, parent):
+        # xml2gbs indexes entries by their path, so siblings need distinct IDs.
+        ids = set()
+        for chapter in parent.find_all('div', osisID=True, recursive=False):
+            title = chapter['osisID']
+            suffix = 2
+            while chapter['osisID'] in ids:
+                chapter['osisID'] = f'{title} {suffix}'
+                suffix += 1
+            ids.add(chapter['osisID'])
+            self._disambiguate_osis_ids(chapter)
+
     def read_resources_from_epub(self, epub_zip):
         self.zip = epub_zip  # TODO check if this is used?
 
         logger.info('Reading articles')
-        soup = self._give_soup(os.path.join(self.path, 'toc.xhtml'))
-        self._process_toc(soup)
+        toc_path = posixpath.join(self.path, 'toc.xhtml')
+        uses_ncx = toc_path not in epub_zip.namelist()
+        if not uses_ncx:
+            toc = self._give_soup(toc_path)
+            chapter_files = [posixpath.join(self.path, item.find('a')['href'].partition('#')[0])
+                             for item in toc.find_all('li')]
+        else:
+            chapter_files = self._read_ncx_toc()
+        self._process_toc(chapter_files)
 
-        bookintro_files = [i for i in epub_zip.namelist() if i.endswith('intros.xhtml')]
+        bookintro_files = [i for i in epub_zip.namelist() if is_html_file(i, 'intros')]
 
         logger.info('Reading intros')
         self._read_resources(bookintro_files, self.intros)
 
         logger.info('Reading other resources')
-        resource_files = [i for i in epub_zip.namelist() if i.endswith('resources.xhtml')
-                          and i.split(os.path.sep)[-1] not in self.used_resources]
+        resource_files = [i for i in epub_zip.namelist() if is_html_file(i, 'resources')
+                          and posixpath.basename(i) not in self.used_resources]
 
         self._read_resources(resource_files, self.other)
 
@@ -316,6 +351,8 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
 
         for pt in self.root_soup.find_all('div', type='section'):
             pt['osisID'] = fix_osis_id(pt.title.text)
+        if uses_ncx:
+            self._disambiguate_osis_ids(self.osistext)
 
     def post_process(self):
         logger.info('Postprosessing resources')
@@ -415,8 +452,10 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
         for i in soup.find_all('div', type='section'):
             self._fix_section_one_level(i, 'h3', 'subSection')
 
-    def _find_title(self, soup):
-        titletag = soup.find(re.compile('^(h1|h2|h3|title)$'))
+    def _find_title(self, soup, prefer_h1=False):
+        titletag = soup.find('h1', recursive=False) if prefer_h1 else None
+        if not titletag:
+            titletag = soup.find(re.compile('^(h1|h2|h3|title)$'))
         if not titletag:
             titletag = soup.find('p', class_='concordance-section')
         if not titletag:
@@ -456,8 +495,8 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
             soup['origFile'] = self.current_filename
             raise self.ExceptionalProcessing
 
-        # TODO: first check if this is really ESV Study Bible!
-        if self.current_filename.endswith('intros.xhtml'):
+        # Move only charts that have a container of their own in the introduction.
+        if is_html_file(self.current_filename, 'intros') and titletag.parent is not soup:
             if title == 'The Battle at Mount Gilboa':
                 self._move_to_studynote(titletag.parent, '1Sam.31.1')
             elif title == 'The Deity of Jesus Christ in 2 Peter':
@@ -467,20 +506,22 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
                      'Song of Solomon—History of Salvation in the Old Testament']:
             target = self.articles.find(osisID=fix_osis_id('History of Salvation in the Old Testament'
                                                            '  Preparing the Way for Christ'))
-            self._fix_sections(soup)
-            self._all_fixes(soup)
-            for i in soup.children:
-                target.append(i)
-            raise self.ExceptionalProcessing
+            if target is not None:
+                self._fix_sections(soup)
+                self._all_fixes(soup)
+                for i in list(soup.children):
+                    target.append(i)
+                raise self.ExceptionalProcessing
         return True
 
     def _process_html_body(self, soup):
-        if self.current_filename.endswith('resources.xhtml') and len(soup.find_all('h1')) > 1:
+        if is_html_file(self.current_filename, 'resources') and len(soup.find_all('h1')) > 1:
             logger.error('More than 1 h1 header in a file %s!', self.current_filename)
 
         self._manual_fixes(soup)
 
-        titletag, title = self._find_title(soup)
+        # Some HTML introductions put a chart heading before the article title.
+        titletag, title = self._find_title(soup, prefer_h1=self.current_filename.endswith('.html'))
 
         soup.name = 'div'
         soup['type'] = 'chapter'
@@ -492,13 +533,26 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
         self._fix_sections(soup)
         self._all_fixes(soup)
 
-    def _process_toc(self, toc_soup):
-        for itm in toc_soup.find_all('li'):
-            fname = itm.find('a')['href'].split('#')[0]
-            if fname.endswith('resources.xhtml'):
-                self.used_resources.append(fname.split(os.path.sep)[-1])
+    def _read_ncx_toc(self):
+        package_path = posixpath.join(self.path, 'content.opf')
+        package = self._give_soup(package_path)
+        spine = package.find('spine', toc=True)
+        toc = package.find('item', id=spine['toc']) if spine else None
+        if toc is None:
+            raise ValueError('No NCX table of contents declared in %s' % package_path)
+        toc_path = posixpath.normpath(posixpath.join(self.path, unquote(toc['href'])))
+        toc_directory = posixpath.dirname(toc_path)
+        nav_map = self._give_soup(toc_path).find('navMap')
+        return [posixpath.normpath(posixpath.join(toc_directory, unquote(item['src'].partition('#')[0])))
+                for item in nav_map.find_all('content', src=True)]
+
+    def _process_toc(self, chapter_files):
+        for fname in chapter_files:
+            name = posixpath.basename(fname)
+            if is_html_file(fname, 'resources') and name not in self.used_resources:
+                self.used_resources.append(name)
                 self.current_filename = fname
-                soup = self._give_soup(os.path.join(self.path, fname)).find('body')
+                soup = self._give_soup(fname).find('body')
                 try:
                     self._process_html_body(soup)
                 except self.TitleNotFound:
@@ -524,8 +578,7 @@ class Articles(AbstractStudyBible, HTML2OsisMixin):
             return root_list
 
     def _give_soup(self, fname):
-        input_data = self.zip.read(fname)
-        return BeautifulSoup(input_data, 'xml')
+        return _read_epub_markup(self.zip, fname)
 
 
 class Convert(object):
@@ -676,17 +729,13 @@ class Convert(object):
 
         cipher_key = self.options.cipher_key
         cmdline = ['osis2mod', commentary_save_path, bible_osis_filename, '-v', 'NRSV', '-z', '-b', '3']
-        if cipher_key:
+        if cipher_key and cipher_key != 'None':
             cmdline.extend(['-c', cipher_key])
 
-        process = subprocess.Popen(cmdline, stdout=subprocess.PIPE)
-        process.communicate()
-        process.wait()
+        subprocess.run(cmdline, stdout=subprocess.DEVNULL, check=True)
         os.unlink(bible_osis_filename)
 
-        process = subprocess.Popen(['xml2gbs', articles_osis_filename, articles_save_path], stdout=subprocess.PIPE)
-        process.communicate()
-        process.wait()
+        subprocess.run(['xml2gbs', articles_osis_filename, articles_save_path], stdout=subprocess.DEVNULL, check=True)
         os.unlink(articles_osis_filename)
 
         zip_filename = output_filename or '%s_module.zip' % self.epub_filename.rsplit('.')[0]
@@ -714,7 +763,7 @@ def main():
                       help='Do not create empty comments (with only links) for non-adjacent verse ranges')
     parser.add_option('--bible_work_id', dest='bible_work_id', default='None',
                       help='Bible work_id (verses are linked there). "None" -> no work_id specification')
-    parser.add_option('--cipher_key', dest='cipher_key', default='None',
+    parser.add_option('--cipher_key', dest='cipher_key',
                       help='Encryption key. "None" -> no encryption')
 
     options, args = parser.parse_args()

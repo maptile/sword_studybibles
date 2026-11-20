@@ -16,6 +16,12 @@ logger = logging.getLogger('html2osis')
 from .bible_data import BOOKREFS
 from .bibleref import IllegalReference, first_reference, Ref
 
+
+def is_html_file(filename, *suffixes):
+    stem, _, extension = filename.rpartition('.')
+    return extension in ('html', 'xhtml') and stem.endswith(suffixes)
+
+
 def parse_studybible_reference(html_id):
     """
         Takes studybibles reference html_id, which is in the following formats:
@@ -213,22 +219,22 @@ class HTML2OsisMixin(object):
                 filename = url
                 verserange = ''
             ref = None
-            if filename.endswith('text.xhtml'):
+            if is_html_file(filename, 'text'):
                 ref = parse_studybible_reference(verserange)
                 ref = self._try_to_get_range(Ref(ref), a)
                 if self.options.bible_work_id != 'None':
                     ref = '%s:%s' % (self.options.bible_work_id, ref)
 
-            elif filename.endswith('studynotes.xhtml'):
+            elif is_html_file(filename, 'studynotes'):
                 try:
                     ref = '%s:%s' % (self.options.commentary_work_id, parse_studybible_reference(verserange))
                 except IllegalReference:
                     a['postpone'] = '1'
                     a['origRef'] = a['href']
-            elif any([filename.endswith(i) for i in ['footnotes.xhtml', 'main.xhtml', 'preferences.xhtml']]):
+            elif is_html_file(filename, 'footnotes', 'main', 'preferences'):
                 logger.warning('Link not handled %s, %s', filename, a.text)
                 a.replace_with('[%s]' % a.text)
-            elif any([filename.endswith(i) for i in ['intros.xhtml', 'resources.xhtml']]):
+            elif is_html_file(filename, 'intros', 'resources'):
                 a['postpone'] = '1'
                 a['origRef'] = a['href']
             else:
@@ -443,7 +449,15 @@ class HTML2OsisMixin(object):
         for rootlevel_tag in self.osistext.find_all(recursive=False, origFile=True):
             self.current_filename = rootlevel_tag['origFile']
             move_to_first_verse = False
-            if rootlevel_tag.name in ['h1', 'hr']:
+            html_file = self.current_filename.endswith('.html')
+            if html_file and rootlevel_tag.name in ('h1', 'hr'):
+                rootlevel_tag.extract()
+                continue
+            elif html_file and rootlevel_tag.name == 'h3':
+                # Standalone chart titles belong to the preceding study note.
+                rootlevel_tag.name = 'title'
+                rootlevel_tag = rootlevel_tag.wrap(self.root_soup.new_tag('div', type='paragraph'))
+            elif rootlevel_tag.name in ['h1', 'hr']:
                 rootlevel_tag['wrap'] = '1'
             elif rootlevel_tag.name == 'header':
                 continue
@@ -452,7 +466,7 @@ class HTML2OsisMixin(object):
                 rootlevel_tag.extract()
                 continue
             elif rootlevel_tag.name == 'div':
-                cls = rootlevel_tag['class']
+                cls = rootlevel_tag.get('class', '')
                 if cls.startswith('object '):
                     type = cls.split(' ')[1]
                     if type not in ['chart', 'map', 'illustration', 'diagram', 'info']:
@@ -463,12 +477,13 @@ class HTML2OsisMixin(object):
                     self._fix_fact(rootlevel_tag)
                 elif cls == 'profile':
                     self._fix_fact(rootlevel_tag)
-                else:
+                elif not (html_file and cls.startswith('image-with-caption')):
                     logger.error('Unknown div class %s', cls)
             elif rootlevel_tag.name == 'p':
-                if rootlevel_tag['class'] not in ['outline-1', 'outline-3', 'outline-4', 'study-note-continue',
-                                                  'study-note']:
-                    logger.error('not handled %s', rootlevel_tag['class'])
+                cls = rootlevel_tag.get('class', '')
+                if cls not in ('outline-1', 'outline-2', 'outline-3', 'outline-4', 'study-note-continue',
+                               'study-note', '', 'chart-footnote', 'image', 'ol', 'table'):
+                    logger.error('not handled %s', cls)
             elif rootlevel_tag.name == 'table':
                 rootlevel_tag = rootlevel_tag.wrap(self.root_soup.new_tag('div', type='paragraph'))
                 self._fix_table(rootlevel_tag)
@@ -478,10 +493,12 @@ class HTML2OsisMixin(object):
                 logger.error('Not handled %s', rootlevel_tag)
 
             self._fix_text_tags(rootlevel_tag)
+            if html_file:
+                self._fix_figure_and_table(rootlevel_tag)
             rootlevel_tag.name = 'div'
             rootlevel_tag['type'] = 'paragraph'
 
-            if 'id' in rootlevel_tag.attrs:
+            if 'id' in rootlevel_tag.attrs and not (html_file and rootlevel_tag.get('class') == 'chart-footnote'):
                 try:
                     ref = parse_studybible_reference(rootlevel_tag['id'])
                 except IllegalReference:
